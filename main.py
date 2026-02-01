@@ -305,7 +305,7 @@ async def main():
                 del seen_signals[k]
 
             iteration += 1
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
 
     except KeyboardInterrupt:
         print("\n🛑 Стоп.")
