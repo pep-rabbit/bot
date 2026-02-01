@@ -9,7 +9,7 @@ dependencies = [
     "aiohttp>=3.13.3",
     "msgspec>=0.20.0",
     "orjson>=3.11.6",
-    "polars[async]>=1.37.1",
+    "polars[async,rtcompat]>=1.37.1",
     "uvloop>=0.22.1",
     "yarl>=1.22.0",
 ]
