@@ -206,7 +206,7 @@ async def analyze_ticker(sem, conn, symbol):
 
 async def scan_market_v2(conn: API):
     try:
-        # Используем get_tickers (стандартное название метода)
+        # Используем tickers (стандартное название метода)
         resp = await conn.tickers(category="linear")
         all_tickers = resp.item
 
@@ -217,7 +217,7 @@ async def scan_market_v2(conn: API):
         ]
         usdt_tickers.sort(key=lambda x: float(x.turnover24h), reverse=True)
         # Сканируем топ-50
-        top_coins = [t.symbol for t in usdt_tickers[:50]]
+        top_coins = [t.symbol for t in usdt_tickers]
 
         sem = asyncio.Semaphore(10)
         tasks = [analyze_ticker(sem, conn, symbol) for symbol in top_coins]
