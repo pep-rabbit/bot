@@ -3,13 +3,17 @@ import msgspec
 import polars as pl
 import uvloop
 from bybit.api import API
-from datetime import datetime, timezone
-from datetime import timedelta
+from datetime import datetime, timezone, timedelta
 
-# --- ФУНКЦИИ СТРАТЕГИИ (Без изменений) ---
+# --- ЛОГИКА СТРАТЕГИИ ---
 
 
 def filter_by_trend(lf: pl.LazyFrame, high_tf_lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Определяет тренд на старшем ТФ (1 час).
+    Используем join_asof, чтобы каждая 15-минутная свеча знала,
+    какой был тренд на часовике в этот момент.
+    """
     trend_lf = (
         high_tf_lf.with_columns(trend_sma=pl.col("close").rolling_mean(window_size=50))
         .with_columns(is_uptrend=(pl.col("close") > pl.col("trend_sma")))
@@ -24,6 +28,10 @@ def filter_by_trend(lf: pl.LazyFrame, high_tf_lf: pl.LazyFrame) -> pl.LazyFrame:
 def find_levels_and_touches(
     lf: pl.LazyFrame, proximity_pct: float = 0.003
 ) -> pl.LazyFrame:
+    """
+    Ищет уровни и касания.
+    Для 15м ТФ окно поиска уровня 20 свечей = 5 часов (локальная полка).
+    """
     return (
         lf.with_columns(
             [
@@ -51,10 +59,7 @@ def find_levels_and_touches(
 def check_accumulation_density(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf.with_columns(
         volatility=(pl.col("high") - pl.col("low")) / pl.col("close")
-    ).with_columns(
-        # is_dense_accumulation=(pl.col("volatility") < 0.015)
-        is_dense_accumulation=(pl.col("volatility") < 0.05)  # Ослаблено для теста
-    )
+    ).with_columns(is_dense_accumulation=(pl.col("volatility") < 0.015))
 
 
 def is_extremum_base(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -102,7 +107,7 @@ def get_strategy_signals(raw_data: pl.LazyFrame, h1_data: pl.LazyFrame):
         .pipe(calculate_trade_params)
     )
 
-    # Логика фильтрации
+    # Фильтр: Минимум 3 из 4 условий + RR >= 3
     return (
         pipeline.filter(
             (
@@ -112,10 +117,12 @@ def get_strategy_signals(raw_data: pl.LazyFrame, h1_data: pl.LazyFrame):
                 + pl.col("is_local_extreme").cast(pl.Int8)
             )
             >= 3
-        )
-        .filter(pl.col("risk_reward") >= 2)  # Ослаблено для теста (было 3)
-        .collect()
-    )
+        ).filter(pl.col("risk_reward") >= 3)
+    ).collect()
+
+
+# --- РАБОТА С API ---
+
 
 async def get_bybit_data(
     conn: API, symbol: str, interval: str, limit: int = 200
@@ -149,16 +156,13 @@ async def get_bybit_data(
         return None
 
 
-# --- АНАЛИЗАТОР (ИЗМЕНЕН) ---
-
-
 async def analyze_ticker(sem, conn, symbol):
-    """Анализирует монету. Возвращает СЛОВАРЬ данных, если сигнал есть."""
+    """Анализирует монету на 15м ТФ."""
     async with sem:
         try:
-            # Берем данные: 30м (рабочий) и 60м (тренд)
-            raw_task = get_bybit_data(conn, symbol, "30", limit=300)
-            h1_task = get_bybit_data(conn, symbol, "60", limit=300)
+            # ИЗМЕНЕНИЕ: Запрашиваем 15 минут (рабочий) и 60 минут (тренд)
+            raw_task = get_bybit_data(conn, symbol, "15", limit=500)
+            h1_task = get_bybit_data(conn, symbol, "60", limit=500)
 
             raw_data, h1_data = await asyncio.gather(raw_task, h1_task)
 
@@ -170,51 +174,49 @@ async def analyze_ticker(sem, conn, symbol):
             if signals.is_empty():
                 return None
 
-            # Проверяем свежесть (последняя свеча)
+            # Проверяем свежесть
             last_candle = signals.tail(1)
             last_ts = last_candle["timestamp"].item(0)
             current_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-            # Актуальность: сигнал в пределах последних 2х свечей (2 * 30 мин = 60 мин)
-            if current_ts - last_ts < 60 * 60 * 1000:
+            # ИЗМЕНЕНИЕ: Сигнал актуален в течение 30 минут (2 свечи по 15м)
+            if current_ts - last_ts < 30 * 60 * 1000:
 
-                # --- ИЗВЛЕЧЕНИЕ ДАННЫХ ДЛЯ КРАСИВОГО ВЫВОДА ---
                 close_price = last_candle["close"].item(0)
                 level = last_candle["resistance_level"].item(0)
-
-                # Рассчитываем расстояние до уровня в %
                 dist_pct = abs(level - close_price) / level * 100
 
                 return {
                     "coin": symbol,
-                    "type": "LONG",  # Стратегия на пробой сопротивления
+                    "type": "LONG",
                     "level": level,
                     "touches": last_candle["touches_count"].item(0),
                     "trend": (
                         "вверх" if last_candle["is_uptrend"].item(0) else "флэт/вниз"
                     ),
-                    "volume": "высокий",  # Мы фильтруем монеты по обороту изначально
+                    "volume": "высокий",
                     "distance": round(dist_pct, 2),
                 }
 
             return None
 
-        except Exception as e:
+        except Exception:
             return None
 
 
 async def scan_market_v2(conn: API):
     try:
+        # Используем get_tickers (стандартное название метода)
         resp = await conn.tickers(category="linear")
         all_tickers = resp.item
 
-        # Фильтр по обороту > 10M USDT
         usdt_tickers = [
             t
             for t in all_tickers
             if t.symbol.endswith("USDT") and float(t.turnover24h) > 10_000_000
         ]
         usdt_tickers.sort(key=lambda x: float(x.turnover24h), reverse=True)
+        # Сканируем топ-50
         top_coins = [t.symbol for t in usdt_tickers[:50]]
 
         sem = asyncio.Semaphore(10)
@@ -223,11 +225,15 @@ async def scan_market_v2(conn: API):
 
         return [res for res in results if res is not None]
     except Exception as e:
-        print(f"⚠️ Ошибка при сканировании: {e}")
+        print(f"⚠️ Ошибка получения тикеров: {e}")
         return []
 
+
+# --- MAIN ---
+
+
 async def main():
-    print("🚀 Запуск сканера [Стратегия 4.8] с защитой от дублей...")
+    print("🚀 Запуск сканера [Стратегия 4.8 | TF: 15m | Trend: 1h]")
 
     conn = API(
         "HRGA0f12NYcrxBfRyD",
@@ -235,11 +241,8 @@ async def main():
         "https://api.bybit.com",
     )
 
-    # СЛОВАРЬ ДЛЯ ПАМЯТИ: { "BTCUSDT": datetime_object }
     seen_signals = {}
-    # ВРЕМЯ ТИШИНЫ: 60 минут (чтобы не спамить одной и той же монетой)
-    COOLDOWN_MINUTES = 60
-
+    COOLDOWN_MINUTES = 60  # Не показывать повторно 1 час
     iteration = 1
 
     try:
@@ -247,33 +250,23 @@ async def main():
             start_time = datetime.now()
             print(f"\n🔍 [Итерация {iteration}] Сканирую рынок...")
 
-            # Получаем все текущие сигналы от сканера
             raw_results = await scan_market_v2(conn)
-
             new_unique_signals = []
             current_time = datetime.now()
 
-            # ФИЛЬТРАЦИЯ ДУБЛЕЙ
+            # Фильтрация дублей
             for res in raw_results:
                 symbol = res["coin"]
-
-                # Если монеты нет в памяти ИЛИ прошло время кулдауна
                 if symbol not in seen_signals or (
                     current_time - seen_signals[symbol]
                 ) > timedelta(minutes=COOLDOWN_MINUTES):
-
                     new_unique_signals.append(res)
-                    seen_signals[symbol] = (
-                        current_time  # Обновляем время последнего сигнала
-                    )
+                    seen_signals[symbol] = current_time
 
-            # ВЫВОД ТОЛЬКО НОВЫХ
+            # Вывод
             if new_unique_signals:
-                print(
-                    f"\n🔥 НОВЫХ СИГНАЛОВ: {len(new_unique_signals)} (Всего найдено: {len(raw_results)})"
-                )
+                print(f"\n🔥 НОВЫХ СИГНАЛОВ: {len(new_unique_signals)}")
                 print("=" * 30)
-
                 for res in new_unique_signals:
                     print(f"Монета: {res['coin']}")
                     print(f"Тип: {res['type']}")
@@ -285,17 +278,13 @@ async def main():
                     print("-" * 30)
             else:
                 elapsed = (datetime.now() - start_time).total_seconds()
-                # Пишем, сколько дублей скрыли, чтобы вы понимали, что бот работает
-                hidden_count = len(raw_results)
-                if hidden_count > 0:
-                    print(
-                        f"😴 Новых нет (Скрыто дублей: {", ".join([f"{k}({v.strftime('%H:%M')})" for k, v in seen_signals.items()])})."
-                    )
+                hidden_str = ", ".join([f"{k}" for k in seen_signals.keys()])
+                if len(raw_results) > 0:
+                    print(f"😴 Новых нет. Скрыты повторы: {hidden_str}")
                 else:
-                    print(f"😴 Сигналов нет.")
+                    print(f"😴 Сигналов нет. (Scan time: {elapsed:.1f}s)")
 
-            # ОЧИСТКА ПАМЯТИ (Опционально: удаляем старые записи, чтобы словарь не пух вечно)
-            # Удаляем ключи, которые старше 2 часов
+            # Очистка памяти
             keys_to_remove = [
                 k
                 for k, v in seen_signals.items()
@@ -305,7 +294,7 @@ async def main():
                 del seen_signals[k]
 
             iteration += 1
-            await asyncio.sleep(30)
+            await asyncio.sleep(20)
 
     except KeyboardInterrupt:
         print("\n🛑 Стоп.")
