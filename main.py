@@ -289,7 +289,7 @@ async def main():
                 hidden_count = len(raw_results)
                 if hidden_count > 0:
                     print(
-                        f"😴 Новых нет (Скрыто дублей: {hidden_count})."
+                        f"😴 Новых нет (Скрыто дублей: {", ".join([f"{k}({v.strftime('%H:%M')})" for k, v in seen_signals.items()])})."
                     )
                 else:
                     print(f"😴 Сигналов нет.")
@@ -305,7 +305,7 @@ async def main():
                 del seen_signals[k]
 
             iteration += 1
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
 
     except KeyboardInterrupt:
         print("\n🛑 Стоп.")
